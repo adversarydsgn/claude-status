@@ -243,8 +243,16 @@ PYEOF
 # ── Main loop ───────────────────────────────────────────
 tput civis 2>/dev/null  # hide cursor
 
+# Re-render immediately on terminal resize
+trap 'clear; render' WINCH
+
+LAST_COLS=$(tput cols 2>/dev/null || echo 80)
+
 while true; do
   clear
   render
-  sleep "$REFRESH"
+  # Sleep in 1-second chunks so WINCH signal is caught quickly
+  for i in $(seq 1 "$REFRESH"); do
+    sleep 1
+  done
 done
