@@ -251,11 +251,16 @@ LAST_COLS=$(tput cols 2>/dev/null || echo 80)
 while true; do
   clear
   render
-  # Sleep in 1-second chunks; press 'r' to refresh immediately
+  # Sleep in 1-second chunks; press r/F5 to refresh, q to quit
   for i in $(seq 1 "$REFRESH"); do
     if read -t 1 -n 1 key 2>/dev/null; then
       [[ "$key" == "r" || "$key" == "R" ]] && break
       [[ "$key" == "q" || "$key" == "Q" ]] && cleanup
+      # F5 sends escape sequence: ESC [ 1 5 ~
+      if [[ "$key" == $'\x1b' ]]; then
+        read -t 0.1 -n 4 seq 2>/dev/null
+        [[ "$seq" == "[15~" ]] && break
+      fi
     fi
   done
 done
