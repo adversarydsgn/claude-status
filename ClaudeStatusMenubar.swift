@@ -1,5 +1,7 @@
 import Cocoa
 
+let APP_VERSION = "1.1.0"
+
 // MARK: - Status Types
 
 struct ComponentStatus {
@@ -13,9 +15,10 @@ struct ComponentStatus {
 }
 
 struct StatusResponse {
-    let overall: String  // none, minor, major, critical
+    let overall: String
     let description: String
     let components: [ComponentStatus]
+    let updatedAt: String
 }
 
 // MARK: - Status Fetcher
@@ -25,14 +28,15 @@ class StatusFetcher {
 
     static func fetch(completion: @escaping (StatusResponse?) -> Void) {
         var request = URLRequest(url: apiURL)
-        request.setValue("claude-status-menubar/1.0", forHTTPHeaderField: "User-Agent")
+        request.setValue("claude-status-menubar/\(APP_VERSION)", forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 10
 
         URLSession.shared.dataTask(with: request) { data, _, error in
             guard let data = data, error == nil,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let status = json["status"] as? [String: String],
-                  let components = json["components"] as? [[String: Any]]
+                  let components = json["components"] as? [[String: Any]],
+                  let page = json["page"] as? [String: Any]
             else {
                 completion(nil)
                 return
@@ -45,13 +49,56 @@ class StatusFetcher {
                 return ComponentStatus(name: name, status: st)
             }
 
+            let updatedAt = (page["updated_at"] as? String ?? "").prefix(19).replacingOccurrences(of: "T", with: " ")
+
             let response = StatusResponse(
                 overall: status["indicator"] ?? "unknown",
                 description: status["description"] ?? "Unknown",
-                components: comps
+                components: comps,
+                updatedAt: String(updatedAt)
             )
             completion(response)
         }.resume()
+    }
+}
+
+// MARK: - Preferences
+
+class Preferences {
+    static let shared = Preferences()
+    private let defaults = UserDefaults.standard
+    private let key = "enabledComponents"
+
+    // All 5 services enabled by default
+    private let allComponents = ["claude.ai", "platform.claude.com", "Claude API", "Claude Code", "Claude for Government"]
+
+    var enabledComponents: Set<String> {
+        get {
+            if let saved = defaults.stringArray(forKey: key) {
+                return Set(saved)
+            }
+            return Set(allComponents)
+        }
+        set {
+            defaults.set(Array(newValue), forKey: key)
+        }
+    }
+
+    func isEnabled(_ name: String) -> Bool {
+        return enabledComponents.contains(name)
+    }
+
+    func toggle(_ name: String) {
+        var current = enabledComponents
+        if current.contains(name) {
+            // Don't allow disabling all — keep at least one
+            if current.count > 1 {
+                current.remove(name)
+            }
+        } else {
+            current.insert(name)
+        }
+        enabledComponents = current
     }
 }
 
@@ -61,28 +108,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var timer: Timer?
     var lastStatus: StatusResponse?
+    var lastFetchTime: Date?
 
-    let trackedComponents = ["claude.ai", "Claude Code"]
     let dashboardPath: String = {
         let bundle = Bundle.main.bundlePath
-        // Look for the script relative to the .app, or fall back to known path
         let relative = (bundle as NSString).deletingLastPathComponent + "/claude-status.sh"
         if FileManager.default.fileExists(atPath: relative) {
             return relative
         }
-        // Fall back to the project directory
+        // Check curl-installed location
+        let curlPath = NSHomeDirectory() + "/.claude-status/claude-status.sh"
+        if FileManager.default.fileExists(atPath: curlPath) {
+            return curlPath
+        }
         let home = NSHomeDirectory()
         return home + "/Desktop/Claude Desktop/Claude Status Terminal/claude-status.sh"
     }()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-
-        // Initial state
-        updateIcon(overall: nil)
+        updateIcon()
         buildMenu()
-
-        // Fetch immediately, then every 60s
         fetchAndUpdate()
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.fetchAndUpdate()
@@ -93,7 +139,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         StatusFetcher.fetch { [weak self] response in
             DispatchQueue.main.async {
                 self?.lastStatus = response
-                self?.updateIcon(overall: response?.overall)
+                self?.lastFetchTime = Date()
+                self?.updateIcon()
                 self?.buildMenu()
             }
         }
@@ -101,58 +148,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Icon Rendering
 
-    // Claude/Anthropic brand orange for the stroke
-    let claudeOrange = NSColor(calibratedRed: 0.85, green: 0.47, blue: 0.34, alpha: 0.85)  // #D97757
+    let claudeOrange = NSColor(calibratedRed: 0.85, green: 0.47, blue: 0.34, alpha: 0.85)
 
-    func updateIcon(overall: String?) {
-        let size = NSSize(width: 36, height: 18)
+    func updateIcon() {
+        let enabled = Preferences.shared.enabledComponents
+        let components = lastStatus?.components.filter { enabled.contains($0.shortName) } ?? []
+        let dotCount = max(components.count, enabled.count)
+
+        let dotRadius: CGFloat = 4.5
+        let strokeWidth: CGFloat = 1.25
+        let spacing: CGFloat = 3.0
+        let padding: CGFloat = 3.0
+        let totalWidth = padding * 2 + CGFloat(dotCount) * (dotRadius * 2) + CGFloat(max(dotCount - 1, 0)) * spacing
+        let size = NSSize(width: max(totalWidth, 18), height: 18)
+
         let image = NSImage(size: size, flipped: false) { rect in
-            // Find status for tracked components
-            let aiStatus = self.lastStatus?.components.first(where: { $0.shortName == "claude.ai" })?.status
-            let codeStatus = self.lastStatus?.components.first(where: { $0.shortName == "Claude Code" })?.status
-
-            let dotRadius: CGFloat = 5.0
-            let strokeWidth: CGFloat = 1.25
-            let padding: CGFloat = 4.0
             let centerY = rect.midY
+            var x = padding + dotRadius
 
-            // Left dot: claude.ai
-            let dot1X = padding + dotRadius
-            let dot1Rect = NSRect(x: dot1X - dotRadius, y: centerY - dotRadius, width: dotRadius * 2, height: dotRadius * 2)
-            // Orange stroke
-            self.claudeOrange.setStroke()
-            let dot1Path = NSBezierPath(ovalIn: dot1Rect.insetBy(dx: strokeWidth / 2, dy: strokeWidth / 2))
-            dot1Path.lineWidth = strokeWidth
-            dot1Path.stroke()
-            // Status fill
-            let dot1Inner = dot1Rect.insetBy(dx: strokeWidth, dy: strokeWidth)
-            self.colorForStatus(aiStatus).setFill()
-            NSBezierPath(ovalIn: dot1Inner).fill()
+            for i in 0..<dotCount {
+                let status: String? = i < components.count ? components[i].status : nil
+                let dotRect = NSRect(x: x - dotRadius, y: centerY - dotRadius, width: dotRadius * 2, height: dotRadius * 2)
 
-            // Right dot: Claude Code
-            let dot2X = dot1X + dotRadius * 2 + padding + 2
-            let dot2Rect = NSRect(x: dot2X - dotRadius, y: centerY - dotRadius, width: dotRadius * 2, height: dotRadius * 2)
-            // Orange stroke
-            self.claudeOrange.setStroke()
-            let dot2Path = NSBezierPath(ovalIn: dot2Rect.insetBy(dx: strokeWidth / 2, dy: strokeWidth / 2))
-            dot2Path.lineWidth = strokeWidth
-            dot2Path.stroke()
-            // Status fill
-            let dot2Inner = dot2Rect.insetBy(dx: strokeWidth, dy: strokeWidth)
-            self.colorForStatus(codeStatus).setFill()
-            NSBezierPath(ovalIn: dot2Inner).fill()
+                // Orange stroke
+                self.claudeOrange.setStroke()
+                let path = NSBezierPath(ovalIn: dotRect.insetBy(dx: strokeWidth / 2, dy: strokeWidth / 2))
+                path.lineWidth = strokeWidth
+                path.stroke()
 
-            // Labels
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 7, weight: .medium),
-                .foregroundColor: NSColor.secondaryLabelColor
-            ]
-            let aiLabel = NSAttributedString(string: "ai", attributes: attrs)
-            let codeLabel = NSAttributedString(string: "</>", attributes: attrs)
+                // Status fill
+                let inner = dotRect.insetBy(dx: strokeWidth, dy: strokeWidth)
+                self.colorForStatus(status).setFill()
+                NSBezierPath(ovalIn: inner).fill()
 
-            aiLabel.draw(at: NSPoint(x: dot1X - 4, y: centerY - dotRadius - 9))
-            codeLabel.draw(at: NSPoint(x: dot2X - 6, y: centerY - dotRadius - 9))
-
+                x += dotRadius * 2 + spacing
+            }
             return true
         }
 
@@ -163,17 +193,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func colorForStatus(_ status: String?) -> NSColor {
         switch status {
         case "operational":
-            return NSColor(calibratedRed: 0.46, green: 0.68, blue: 0.16, alpha: 1.0)  // #76AD2A
+            return NSColor(calibratedRed: 0.46, green: 0.68, blue: 0.16, alpha: 1.0)
         case "degraded_performance":
-            return NSColor(calibratedRed: 0.98, green: 0.65, blue: 0.17, alpha: 1.0)  // #FAA72A
+            return NSColor(calibratedRed: 0.98, green: 0.65, blue: 0.17, alpha: 1.0)
         case "partial_outage":
-            return NSColor(calibratedRed: 0.91, green: 0.38, blue: 0.21, alpha: 1.0)  // #E86235
+            return NSColor(calibratedRed: 0.91, green: 0.38, blue: 0.21, alpha: 1.0)
         case "major_outage":
-            return NSColor(calibratedRed: 0.88, green: 0.26, blue: 0.26, alpha: 1.0)  // #E04343
+            return NSColor(calibratedRed: 0.88, green: 0.26, blue: 0.26, alpha: 1.0)
         case "under_maintenance":
-            return NSColor(calibratedRed: 0.17, green: 0.52, blue: 0.86, alpha: 1.0)  // #2C84DB
+            return NSColor(calibratedRed: 0.17, green: 0.52, blue: 0.86, alpha: 1.0)
         default:
-            return NSColor.tertiaryLabelColor  // gray when unknown/loading
+            return NSColor.tertiaryLabelColor
         }
     }
 
@@ -182,31 +212,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func buildMenu() {
         let menu = NSMenu()
 
-        // Overall status
-        let overallTitle = lastStatus?.description ?? "Loading..."
-        let overallItem = NSMenuItem(title: overallTitle, action: nil, keyEquivalent: "")
-        overallItem.attributedTitle = NSAttributedString(
-            string: overallTitle,
+        // ── Header: flag + overall status ──────────────
+        let headerTitle = "🇺🇸 \(lastStatus?.description ?? "Loading...")"
+        let headerItem = NSMenuItem(title: headerTitle, action: nil, keyEquivalent: "")
+        headerItem.attributedTitle = NSAttributedString(
+            string: headerTitle,
             attributes: [.font: NSFont.systemFont(ofSize: 13, weight: .semibold)]
         )
-        menu.addItem(overallItem)
+        menu.addItem(headerItem)
         menu.addItem(NSMenuItem.separator())
 
-        // Component statuses
+        // ── Component statuses with checkboxes ─────────
         if let components = lastStatus?.components {
+            let enabledTitle = NSMenuItem(title: "Services", action: nil, keyEquivalent: "")
+            enabledTitle.attributedTitle = NSAttributedString(
+                string: "SERVICES",
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 10, weight: .bold),
+                    .foregroundColor: NSColor.secondaryLabelColor
+                ]
+            )
+            menu.addItem(enabledTitle)
+
             for comp in components {
                 let icon = statusIcon(comp.status)
                 let label = statusLabel(comp.status)
                 let title = "\(icon)  \(comp.shortName) — \(label)"
-                let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                let item = NSMenuItem(title: title, action: #selector(toggleComponent(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = comp.shortName
 
-                // Highlight tracked components
-                if trackedComponents.contains(comp.shortName) {
-                    item.attributedTitle = NSAttributedString(
-                        string: title,
-                        attributes: [.font: NSFont.systemFont(ofSize: 13, weight: .medium)]
-                    )
+                // Checkbox state
+                if Preferences.shared.isEnabled(comp.shortName) {
+                    item.state = .on
+                } else {
+                    item.state = .off
                 }
+
                 menu.addItem(item)
             }
         } else {
@@ -215,25 +257,57 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
-        // Open Dashboard
+        // ── Actions ────────────────────────────────────
         let dashItem = NSMenuItem(title: "Open Terminal Dashboard", action: #selector(openDashboard), keyEquivalent: "d")
         dashItem.target = self
         menu.addItem(dashItem)
 
-        // Open in Browser
         let browserItem = NSMenuItem(title: "Open status.claude.com", action: #selector(openBrowser), keyEquivalent: "b")
         browserItem.target = self
         menu.addItem(browserItem)
 
         menu.addItem(NSMenuItem.separator())
 
-        // Refresh
+        // ── Footer: version + last update ──────────────
         let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refreshNow), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
 
+        // Last updated timestamp
+        var infoLine = "v\(APP_VERSION)"
+        if let fetchTime = lastFetchTime {
+            let fmt = DateFormatter()
+            fmt.dateFormat = "h:mm:ss a"
+            infoLine += " · Updated \(fmt.string(from: fetchTime))"
+        }
+        if let apiTime = lastStatus?.updatedAt, !apiTime.isEmpty {
+            infoLine += "\nAPI: \(apiTime) UTC"
+        }
+        let infoItem = NSMenuItem(title: infoLine, action: nil, keyEquivalent: "")
+        infoItem.attributedTitle = NSAttributedString(
+            string: infoLine,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 10),
+                .foregroundColor: NSColor.tertiaryLabelColor
+            ]
+        )
+        menu.addItem(infoItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // ── Flag footer ────────────────────────────────
+        let flagItem = NSMenuItem(title: "🇺🇸 Made in America", action: nil, keyEquivalent: "")
+        flagItem.attributedTitle = NSAttributedString(
+            string: "🇺🇸 Made in America",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+        )
+        menu.addItem(flagItem)
+
         // Quit
-        let quitItem = NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: "Quit Claude Status", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
 
@@ -263,6 +337,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Actions
+
+    @objc func toggleComponent(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String else { return }
+        Preferences.shared.toggle(name)
+        updateIcon()
+        buildMenu()
+    }
 
     @objc func openDashboard() {
         let script = """
@@ -294,5 +375,5 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
-app.setActivationPolicy(.accessory)  // no dock icon, menubar only
+app.setActivationPolicy(.accessory)
 app.run()
