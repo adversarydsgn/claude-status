@@ -135,14 +135,12 @@ def render_bar(days, bar_len):
     return bar, pct
 
 # ── Header ──────────────────────────────────────────────
-print()
 title = 'CLAUDE STATUS MONITOR'
 pad_l = (width - 2 - len(title)) // 2
 pad_r = width - 2 - len(title) - pad_l
 print(f'  {BOLD}{WHITE}╔{"═"*(width-2)}╗{RST}')
 print(f'  {BOLD}{WHITE}║{" "*pad_l}{title}{" "*pad_r}║{RST}')
 print(f'  {BOLD}{WHITE}╚{"═"*(width-2)}╝{RST}')
-print()
 
 # ── Overall banner ──────────────────────────────────────
 ind = api['status']['indicator']
