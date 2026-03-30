@@ -101,6 +101,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Icon Rendering
 
+    // Claude/Anthropic brand orange for the stroke
+    let claudeOrange = NSColor(calibratedRed: 0.85, green: 0.47, blue: 0.34, alpha: 0.85)  // #D97757
+
     func updateIcon(overall: String?) {
         let size = NSSize(width: 36, height: 18)
         let image = NSImage(size: size, flipped: false) { rect in
@@ -109,20 +112,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let codeStatus = self.lastStatus?.components.first(where: { $0.shortName == "Claude Code" })?.status
 
             let dotRadius: CGFloat = 5.0
+            let strokeWidth: CGFloat = 1.25
             let padding: CGFloat = 4.0
             let centerY = rect.midY
 
             // Left dot: claude.ai
             let dot1X = padding + dotRadius
             let dot1Rect = NSRect(x: dot1X - dotRadius, y: centerY - dotRadius, width: dotRadius * 2, height: dotRadius * 2)
+            // Orange stroke
+            self.claudeOrange.setStroke()
+            let dot1Path = NSBezierPath(ovalIn: dot1Rect.insetBy(dx: strokeWidth / 2, dy: strokeWidth / 2))
+            dot1Path.lineWidth = strokeWidth
+            dot1Path.stroke()
+            // Status fill
+            let dot1Inner = dot1Rect.insetBy(dx: strokeWidth, dy: strokeWidth)
             self.colorForStatus(aiStatus).setFill()
-            NSBezierPath(ovalIn: dot1Rect).fill()
+            NSBezierPath(ovalIn: dot1Inner).fill()
 
             // Right dot: Claude Code
             let dot2X = dot1X + dotRadius * 2 + padding + 2
             let dot2Rect = NSRect(x: dot2X - dotRadius, y: centerY - dotRadius, width: dotRadius * 2, height: dotRadius * 2)
+            // Orange stroke
+            self.claudeOrange.setStroke()
+            let dot2Path = NSBezierPath(ovalIn: dot2Rect.insetBy(dx: strokeWidth / 2, dy: strokeWidth / 2))
+            dot2Path.lineWidth = strokeWidth
+            dot2Path.stroke()
+            // Status fill
+            let dot2Inner = dot2Rect.insetBy(dx: strokeWidth, dy: strokeWidth)
             self.colorForStatus(codeStatus).setFill()
-            NSBezierPath(ovalIn: dot2Rect).fill()
+            NSBezierPath(ovalIn: dot2Inner).fill()
 
             // Labels
             let attrs: [NSAttributedString.Key: Any] = [
