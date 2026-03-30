@@ -234,7 +234,7 @@ print()
 
 # ── Footer ──────────────────────────────────────────────
 updated = api['page']['updated_at'][:19].replace('T', ' ')
-print(f'  {DIM}Last updated: {updated} UTC │ Refreshing every 30s │ Ctrl+C to exit{RST}')
+print(f'  {DIM}Last updated: {updated} UTC │ r = refresh │ q = quit{RST}')
 print(f'  {DIM}Source: status.claude.com{RST}')
 print()
 PYEOF
@@ -251,8 +251,11 @@ LAST_COLS=$(tput cols 2>/dev/null || echo 80)
 while true; do
   clear
   render
-  # Sleep in 1-second chunks so WINCH signal is caught quickly
+  # Sleep in 1-second chunks; press 'r' to refresh immediately
   for i in $(seq 1 "$REFRESH"); do
-    sleep 1
+    if read -t 1 -n 1 key 2>/dev/null; then
+      [[ "$key" == "r" || "$key" == "R" ]] && break
+      [[ "$key" == "q" || "$key" == "Q" ]] && cleanup
+    fi
   done
 done
