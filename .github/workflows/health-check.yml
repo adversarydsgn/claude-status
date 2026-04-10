@@ -6,6 +6,9 @@ on:
     - cron: '0 8 * * *'
   workflow_dispatch: # Allow manual trigger
 
+permissions:
+  issues: write
+
 jobs:
   api-check:
     name: Verify Status API
@@ -17,7 +20,7 @@ jobs:
         run: |
           echo "=== Testing API endpoint ==="
           HTTP_CODE=$(curl -s -o /tmp/response.json -w "%{http_code}" \
-            -H "User-Agent: claude-status-terminal-ci/1.0" \
+            -H "User-Agent: claude-status-ci/1.0" \
             "https://status.claude.com/api/v2/summary.json")
 
           echo "HTTP status: $HTTP_CODE"
@@ -89,7 +92,7 @@ jobs:
 
           req = urllib.request.Request(
               'https://status.claude.com/',
-              headers={'User-Agent': 'claude-status-terminal-ci/1.0'}
+              headers={'User-Agent': 'claude-status-ci/1.0'}
           )
           with urllib.request.urlopen(req, timeout=15) as r:
               html = r.read().decode('utf-8', errors='replace')
@@ -132,7 +135,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Pillow
-        run: pip3 install Pillow
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install Pillow
 
       - name: Compile Swift menubar app
         run: |
@@ -144,7 +149,7 @@ jobs:
 
       - name: Generate icon
         run: |
-          python3 generate-icon.py
+          /tmp/venv/bin/python3 generate-icon.py
           test -f AppIcon.icns
           echo "✓ Icon generated"
 
