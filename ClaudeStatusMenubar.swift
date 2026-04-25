@@ -1,6 +1,6 @@
 import Cocoa
 
-let APP_VERSION = "2.0.0"
+let APP_VERSION = "2.1.0"
 let SWIFT_SOURCE_URL = "https://raw.githubusercontent.com/adversarydsgn/claude-status/main/ClaudeStatusMenubar.swift"
 
 // MARK: - Self-Updater
@@ -35,24 +35,16 @@ class SelfUpdater {
             compile.arguments = ["-O", "-o", tmpBinary, "-framework", "Cocoa", "-framework", "Foundation", tmpSource]
             compile.standardOutput = FileHandle.nullDevice
             compile.standardError = FileHandle.nullDevice
-
-            do {
-                try compile.run()
-                compile.waitUntilExit()
-            } catch { return }
-
+            do { try compile.run(); compile.waitUntilExit() } catch { return }
             guard compile.terminationStatus == 0 else { return }
 
             do {
                 try FileManager.default.removeItem(atPath: execPath)
                 try FileManager.default.moveItem(atPath: tmpBinary, toPath: execPath)
-
                 let chmod = Process()
                 chmod.executableURL = URL(fileURLWithPath: "/bin/chmod")
                 chmod.arguments = ["+x", execPath]
-                try chmod.run()
-                chmod.waitUntilExit()
-
+                try chmod.run(); chmod.waitUntilExit()
                 DispatchQueue.main.async {
                     let task = Process()
                     task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
@@ -61,7 +53,6 @@ class SelfUpdater {
                     NSApp.terminate(nil)
                 }
             } catch { return }
-
             try? FileManager.default.removeItem(atPath: tmpSource)
         }
     }
@@ -91,135 +82,113 @@ struct StatusResponse {
 class UptimeFetcher {
     static let shared = UptimeFetcher()
     private var uptimeData: [String: [Double]] = [:]
-    private var timer: Timer?
+    var onDataUpdated: (() -> Void)?
+    private var uptimeTimer: Timer?
 
     func startFetching() {
-        fetchUptime()
-        timer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
-            self?.fetchUptime()
+        doFetch()
+        if uptimeTimer == nil {
+            uptimeTimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
+                self?.doFetch()
+            }
         }
     }
 
-    private func fetchUptime() {
-        guard let url = URL(string: "https://status.claude.com/") else { return }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 15
-        request.cachePolicy = .reloadIgnoringLocalCacheData
-        request.setValue("claude-status-menubar/\(APP_VERSION)", forHTTPHeaderField: "User-Agent")
+    func refresh() { doFetch() }
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
-            guard let data = data, error == nil,
-                  let html = String(data: data, encoding: .utf8) else { return }
-            self?.parseUptimeData(from: html)
+    private func doFetch() {
+        guard let url = URL(string: "https://status.claude.com/") else { return }
+        var req = URLRequest(url: url)
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        req.timeoutInterval = 15
+        req.setValue("claude-status-menubar/\(APP_VERSION)", forHTTPHeaderField: "User-Agent")
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let data = data, let html = String(data: data, encoding: .utf8) else { return }
+            self?.parse(html)
         }.resume()
     }
 
-    private func parseUptimeData(from html: String) {
-        guard let startRange = html.range(of: "var uptimeData = ") ?? html.range(of: "uptimeData = ") else { return }
-        let afterVar = html[startRange.upperBound...]
-
-        guard let jsonStart = afterVar.firstIndex(where: { $0 == "{" || $0 == "[" }) else { return }
-        let jsonSubstring = afterVar[jsonStart...]
-
-        let openChar: Character = jsonSubstring[jsonSubstring.startIndex] == "{" ? "{" : "["
-        let closeChar: Character = openChar == "{" ? "}" : "]"
+    private func parse(_ html: String) {
+        // Match the Python CI logic: find "uptimeData" then the next {
+        guard let keyRange = html.range(of: "uptimeData") else { return }
+        let rest = html[keyRange.upperBound...]
+        guard let braceIdx = rest.firstIndex(of: "{") else { return }
+        let fromBrace = rest[braceIdx...]
 
         var depth = 0
-        var endIndex = jsonSubstring.startIndex
-        for (idx, ch) in jsonSubstring.enumerated() {
-            if ch == openChar { depth += 1 }
-            else if ch == closeChar {
+        var endIdx = fromBrace.startIndex
+        for i in fromBrace.indices {
+            if fromBrace[i] == "{" { depth += 1 }
+            else if fromBrace[i] == "}" {
                 depth -= 1
-                if depth == 0 {
-                    endIndex = jsonSubstring.index(jsonSubstring.startIndex, offsetBy: idx)
-                    break
-                }
+                if depth == 0 { endIdx = i; break }
             }
         }
-
         guard depth == 0,
-              let jsonData = String(jsonSubstring[jsonSubstring.startIndex...endIndex]).data(using: .utf8),
-              let parsed = try? JSONSerialization.jsonObject(with: jsonData)
+              let jsonData = String(fromBrace[fromBrace.startIndex...endIdx]).data(using: .utf8),
+              let dict = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any]
         else { return }
 
         var result: [String: [Double]] = [:]
-        if let arr = parsed as? [[String: Any]] {
-            for item in arr { parseComponentItem(item, into: &result) }
-        } else if let dict = parsed as? [String: Any] {
-            if let components = dict["components"] as? [[String: Any]] {
-                for item in components { parseComponentItem(item, into: &result) }
-            } else {
-                parseComponentItem(dict, into: &result)
-            }
+        for (_, value) in dict {
+            guard let compDict = value as? [String: Any],
+                  let component = compDict["component"] as? [String: Any],
+                  let name = component["name"] as? String,
+                  let days = compDict["days"] as? [[String: Any]]
+            else { continue }
+            let scores = days.compactMap { $0["uptime_score"] as? Double }
+            if !scores.isEmpty { result[name] = scores }
         }
 
-        DispatchQueue.main.async { self.uptimeData = result }
-    }
-
-    private func parseComponentItem(_ item: [String: Any], into result: inout [String: [Double]]) {
-        guard let name = item["name"] as? String else { return }
-        var scores: [Double] = []
-        if let days = item["days"] as? [[String: Any]] {
-            for day in days {
-                if let score = day["uptime_score"] as? Double {
-                    scores.append(score)
-                } else if let score = day["uptime_score"] as? Int {
-                    scores.append(Double(score))
-                }
-            }
-        }
-        if !scores.isEmpty { result[name] = scores }
-        if let children = item["components"] as? [[String: Any]] {
-            for child in children { parseComponentItem(child, into: &result) }
+        DispatchQueue.main.async {
+            self.uptimeData = result
+            self.onDataUpdated?()
         }
     }
 
-    func uptimeScores(for shortName: String) -> [Double]? {
-        for (componentName, scores) in uptimeData {
-            let lower = componentName.lowercased()
-            let matched: Bool
+    func scores(for shortName: String) -> [Double]? {
+        for (name, scores) in uptimeData {
+            let lo = name.lowercased()
+            let match: Bool
             switch shortName {
-            case "platform.claude.com":
-                matched = lower.contains("formerly") || lower.contains("platform")
-            case "Claude API":
-                matched = lower.contains("api")
-            default:
-                matched = componentName == shortName || lower.contains(shortName.lowercased())
+            case "platform.claude.com": match = lo.contains("formerly") || lo.contains("platform")
+            case "Claude API":          match = lo.contains("api")
+            default:                   match = name == shortName || lo.contains(shortName.lowercased())
             }
-            if matched { return Array(scores.suffix(90)) }
+            if match { return Array(scores.suffix(90)) }
         }
         return nil
     }
 
-    func buildUptimeImage(for shortName: String) -> NSImage? {
-        guard let scores = uptimeScores(for: shortName), !scores.isEmpty else { return nil }
-        let barW: CGFloat = 3.0
-        let gap: CGFloat = 0.5
-        let h: CGFloat = 14.0
-        let count = scores.count
-        let totalW = CGFloat(count) * barW + CGFloat(max(count - 1, 0)) * gap
+    func average(for shortName: String) -> Double? {
+        guard let s = scores(for: shortName), !s.isEmpty else { return nil }
+        return s.reduce(0, +) / Double(s.count)
+    }
 
-        return NSImage(size: NSSize(width: totalW, height: h), flipped: false) { _ in
-            for (i, score) in scores.enumerated() {
+    func barImage(for shortName: String, availableWidth: CGFloat = 240) -> NSImage? {
+        guard let s = scores(for: shortName), !s.isEmpty else { return nil }
+        let count = s.count
+        let gap: CGFloat = 0.5
+        let totalGaps = CGFloat(max(count - 1, 0)) * gap
+        let barW = max(1.5, (availableWidth - totalGaps) / CGFloat(count))
+        let actualW = CGFloat(count) * barW + totalGaps
+        let h: CGFloat = 12
+        return NSImage(size: NSSize(width: actualW, height: h), flipped: false) { _ in
+            for (i, score) in s.enumerated() {
                 let x = CGFloat(i) * (barW + gap)
-                self.colorForUptime(score).setFill()
-                NSBezierPath(roundedRect: NSRect(x: x, y: 1, width: barW, height: h - 2), xRadius: 0.5, yRadius: 0.5).fill()
+                self.color(for: score).setFill()
+                NSBezierPath(roundedRect: NSRect(x: x, y: 0, width: barW, height: h), xRadius: 0.5, yRadius: 0.5).fill()
             }
             return true
         }
     }
 
-    func averageUptime(for shortName: String) -> Double? {
-        guard let scores = uptimeScores(for: shortName), !scores.isEmpty else { return nil }
-        return scores.reduce(0, +) / Double(scores.count)
-    }
-
-    func colorForUptime(_ score: Double) -> NSColor {
-        if score >= 100.0 { return NSColor(calibratedRed: 0.46, green: 0.68, blue: 0.16, alpha: 1.0) }
-        if score >= 99.0  { return NSColor(calibratedRed: 0.62, green: 0.78, blue: 0.26, alpha: 1.0) }
-        if score >= 95.0  { return NSColor(calibratedRed: 0.98, green: 0.65, blue: 0.17, alpha: 1.0) }
-        if score >= 90.0  { return NSColor(calibratedRed: 0.91, green: 0.38, blue: 0.21, alpha: 1.0) }
-        return NSColor(calibratedRed: 0.88, green: 0.26, blue: 0.26, alpha: 1.0)
+    func color(for score: Double) -> NSColor {
+        if score >= 100 { return NSColor(calibratedRed: 0.46, green: 0.68, blue: 0.16, alpha: 1) }
+        if score >= 99  { return NSColor(calibratedRed: 0.62, green: 0.78, blue: 0.26, alpha: 1) }
+        if score >= 95  { return NSColor(calibratedRed: 0.98, green: 0.65, blue: 0.17, alpha: 1) }
+        if score >= 90  { return NSColor(calibratedRed: 0.91, green: 0.38, blue: 0.21, alpha: 1) }
+        return NSColor(calibratedRed: 0.88, green: 0.26, blue: 0.26, alpha: 1)
     }
 }
 
@@ -232,7 +201,6 @@ class StatusFetcher {
         var request = URLRequest(url: apiURL)
         request.setValue("claude-status-menubar/\(APP_VERSION)", forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 10
-
         URLSession.shared.dataTask(with: request) { data, _, error in
             guard let data = data, error == nil,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -240,20 +208,15 @@ class StatusFetcher {
                   let components = json["components"] as? [[String: Any]],
                   let page = json["page"] as? [String: Any]
             else { completion(nil); return }
-
             let comps = components.compactMap { comp -> ComponentStatus? in
-                guard let name = comp["name"] as? String,
-                      let st = comp["status"] as? String else { return nil }
+                guard let name = comp["name"] as? String, let st = comp["status"] as? String else { return nil }
                 return ComponentStatus(name: name, status: st)
             }
-
             let updatedAt = (page["updated_at"] as? String ?? "").prefix(19).replacingOccurrences(of: "T", with: " ")
-            completion(StatusResponse(
-                overall: status["indicator"] ?? "unknown",
-                description: status["description"] ?? "Unknown",
-                components: comps,
-                updatedAt: String(updatedAt)
-            ))
+            completion(StatusResponse(overall: status["indicator"] ?? "unknown",
+                                      description: status["description"] ?? "Unknown",
+                                      components: comps,
+                                      updatedAt: String(updatedAt)))
         }.resume()
     }
 }
@@ -301,10 +264,7 @@ class Preferences {
 
     func sorted(_ components: [ComponentStatus]) -> [ComponentStatus] {
         let order = componentOrder
-        var result: [ComponentStatus] = []
-        for name in order {
-            if let comp = components.first(where: { $0.shortName == name }) { result.append(comp) }
-        }
+        var result = order.compactMap { name in components.first { $0.shortName == name } }
         for comp in components where !order.contains(comp.shortName) { result.append(comp) }
         return result
     }
@@ -314,15 +274,156 @@ class Preferences {
         for n in allNames where !order.contains(n) { order.append(n) }
         order = order.filter { allNames.contains($0) }
         guard let idx = order.firstIndex(of: name) else { return }
-        let newIdx = idx + offset
-        guard newIdx >= 0 && newIdx < order.count else { return }
+        let newIdx = max(0, min(order.count - 1, idx + offset))
+        guard newIdx != idx else { return }
         order.remove(at: idx)
         order.insert(name, at: newIdx)
         componentOrder = order
     }
 }
 
-// MARK: - Menu Bar App
+// MARK: - Service Row View
+
+class ServiceRowView: NSView {
+    let shortName: String
+    private let statusEmoji: String
+    private let statusLabel: String
+    private var isServiceEnabled: Bool
+
+    var toggleAction: (() -> Void)?
+    var moveAction: ((Int) -> Void)?
+
+    private var isHovered = false
+    private var dragStartWindowY: CGFloat = 0
+    private var eventMonitor: Any?
+
+    static let rowHeight: CGFloat = 22
+    static let handleW: CGFloat = 30
+    static let menuWidth: CGFloat = 310
+
+    init(shortName: String, statusEmoji: String, statusLabel: String, isEnabled: Bool) {
+        self.shortName = shortName
+        self.statusEmoji = statusEmoji
+        self.statusLabel = statusLabel
+        self.isServiceEnabled = isEnabled
+        super.init(frame: NSRect(x: 0, y: 0, width: ServiceRowView.menuWidth, height: ServiceRowView.rowHeight))
+        let ta = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil)
+        addTrackingArea(ta)
+    }
+    required init?(coder: NSCoder) { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if isHovered {
+            NSColor.selectedMenuItemColor.setFill()
+            bounds.fill()
+        }
+
+        let textColor: NSColor = isHovered
+            ? (isServiceEnabled ? .white : NSColor.white.withAlphaComponent(0.45))
+            : (isServiceEnabled ? .labelColor : .tertiaryLabelColor)
+        let dimColor: NSColor = isHovered ? NSColor.white.withAlphaComponent(0.55) : .quaternaryLabelColor
+
+        // ≡ drag handle (3 horizontal bars)
+        dimColor.setFill()
+        let lw: CGFloat = 10, lh: CGFloat = 1.5
+        let lx = (ServiceRowView.handleW - lw) / 2
+        for i in 0..<3 {
+            let ly = bounds.midY + CGFloat(i - 1) * 4.5 - lh / 2
+            NSBezierPath(rect: NSRect(x: lx, y: ly, width: lw, height: lh)).fill()
+        }
+
+        // Status + name
+        let title = "\(statusEmoji)  \(shortName) — \(statusLabel)"
+        let titleAS = NSAttributedString(string: title, attributes: [
+            .font: NSFont.systemFont(ofSize: 13),
+            .foregroundColor: textColor
+        ])
+        let ty = (bounds.height - titleAS.size().height) / 2
+        titleAS.draw(at: NSPoint(x: ServiceRowView.handleW + 2, y: ty))
+
+        // Checkmark if enabled
+        if isServiceEnabled {
+            let checkColor: NSColor = isHovered ? NSColor.white.withAlphaComponent(0.7) : .tertiaryLabelColor
+            let ck = NSAttributedString(string: "✓", attributes: [
+                .font: NSFont.systemFont(ofSize: 12),
+                .foregroundColor: checkColor
+            ])
+            ck.draw(at: NSPoint(x: bounds.width - ck.size().width - 14, y: ty))
+        }
+    }
+
+    override func mouseEntered(with event: NSEvent) { isHovered = true; needsDisplay = true }
+    override func mouseExited(with event: NSEvent) { isHovered = false; needsDisplay = true }
+
+    override func mouseDown(with event: NSEvent) {
+        let loc = convert(event.locationInWindow, from: nil)
+        if loc.x < ServiceRowView.handleW {
+            dragStartWindowY = event.locationInWindow.y
+            NSCursor.closedHand.push()
+            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDragged, .leftMouseUp]) { [weak self] e in
+                guard let self = self else { return e }
+                if e.type == .leftMouseUp { self.endDrag(e) }
+                return e
+            }
+        } else {
+            isServiceEnabled.toggle()
+            needsDisplay = true
+            toggleAction?()
+        }
+    }
+
+    private func endDrag(_ event: NSEvent) {
+        NSCursor.pop()
+        if let m = eventMonitor { NSEvent.removeMonitor(m); eventMonitor = nil }
+        let deltaY = dragStartWindowY - event.locationInWindow.y
+        let rows = Int((deltaY / ServiceRowView.rowHeight).rounded())
+        if rows != 0 { moveAction?(rows) }
+    }
+}
+
+// MARK: - Uptime Row View
+
+class UptimeRowView: NSView {
+    private let shortName: String
+    static let rowHeight: CGFloat = 22
+
+    init(shortName: String) {
+        self.shortName = shortName
+        super.init(frame: NSRect(x: 0, y: 0, width: ServiceRowView.menuWidth, height: UptimeRowView.rowHeight))
+    }
+    required init?(coder: NSCoder) { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let indent: CGFloat = ServiceRowView.handleW + 2
+        let uptime = UptimeFetcher.shared
+
+        if let img = uptime.barImage(for: shortName, availableWidth: 200) {
+            let imgY = (bounds.height - img.size.height) / 2
+            img.draw(in: NSRect(x: indent, y: imgY, width: img.size.width, height: img.size.height))
+
+            if let avg = uptime.average(for: shortName) {
+                let pctStr = String(format: "%.2f%% · 90d", avg)
+                let pctAS = NSAttributedString(string: pctStr, attributes: [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .regular),
+                    .foregroundColor: NSColor.secondaryLabelColor
+                ])
+                let tx = indent + img.size.width + 8
+                pctAS.draw(at: NSPoint(x: tx, y: (bounds.height - pctAS.size().height) / 2))
+            }
+        } else {
+            let loadAS = NSAttributedString(string: "loading uptime...", attributes: [
+                .font: NSFont.systemFont(ofSize: 10),
+                .foregroundColor: NSColor.quaternaryLabelColor
+            ])
+            loadAS.draw(at: NSPoint(x: indent, y: (bounds.height - loadAS.size().height) / 2))
+        }
+    }
+
+    // Absorb clicks — do not close menu
+    override func mouseDown(with event: NSEvent) {}
+}
+
+// MARK: - App Delegate
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
@@ -336,8 +437,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let bundle = Bundle.main.bundlePath
         let relative = (bundle as NSString).deletingLastPathComponent + "/claude-status.sh"
         if FileManager.default.fileExists(atPath: relative) { return relative }
-        let curlPath = NSHomeDirectory() + "/.claude-status/claude-status.sh"
-        if FileManager.default.fileExists(atPath: curlPath) { return curlPath }
+        let curl = NSHomeDirectory() + "/.claude-status/claude-status.sh"
+        if FileManager.default.fileExists(atPath: curl) { return curl }
         return NSHomeDirectory() + "/Desktop/Claude Desktop/Claude Status Terminal/claude-status.sh"
     }()
 
@@ -346,7 +447,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         updateIcon()
         buildMenu()
         fetchAndUpdate()
+
+        UptimeFetcher.shared.onDataUpdated = { [weak self] in self?.buildMenu() }
         UptimeFetcher.shared.startFetching()
+
         timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.fetchAndUpdate()
         }
@@ -363,34 +467,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: - Icon Rendering
+    // MARK: - Icon
 
     func updateIcon() {
         let enabled = Preferences.shared.enabledComponents
         let allSorted = lastStatus.map { Preferences.shared.sorted($0.components) } ?? []
+        // Only render dots for components that are both enabled AND have live status
         let components = allSorted.filter { enabled.contains($0.shortName) }
-        let dotCount = max(components.count, enabled.count)
+        let dotCount = components.count  // fixed: no phantom dark dots
 
         let dotRadius: CGFloat = 5.5
-        let strokeWidth: CGFloat = 1.25
+        let strokeW: CGFloat = 1.25
         let spacing: CGFloat = 3.0
         let padding: CGFloat = 3.0
-        let totalWidth = padding * 2 + CGFloat(dotCount) * (dotRadius * 2) + CGFloat(max(dotCount - 1, 0)) * spacing
-        let size = NSSize(width: max(totalWidth, 20), height: 18)
+        let totalW = padding * 2 + CGFloat(dotCount) * (dotRadius * 2) + CGFloat(max(dotCount - 1, 0)) * spacing
+        let size = NSSize(width: max(totalW, 20), height: 18)
 
         let image = NSImage(size: size, flipped: false) { rect in
-            let centerY = rect.midY
+            let cy = rect.midY
             var x = padding + dotRadius
             for i in 0..<dotCount {
                 let status: String? = i < components.count ? components[i].status : nil
-                let dotRect = NSRect(x: x - dotRadius, y: centerY - dotRadius, width: dotRadius * 2, height: dotRadius * 2)
+                let dr = NSRect(x: x - dotRadius, y: cy - dotRadius, width: dotRadius * 2, height: dotRadius * 2)
                 self.claudeOrange.setStroke()
-                let path = NSBezierPath(ovalIn: dotRect.insetBy(dx: strokeWidth / 2, dy: strokeWidth / 2))
-                path.lineWidth = strokeWidth
+                let path = NSBezierPath(ovalIn: dr.insetBy(dx: strokeW / 2, dy: strokeW / 2))
+                path.lineWidth = strokeW
                 path.stroke()
-                let inner = dotRect.insetBy(dx: strokeWidth, dy: strokeWidth)
                 self.colorForStatus(status).setFill()
-                NSBezierPath(ovalIn: inner).fill()
+                NSBezierPath(ovalIn: dr.insetBy(dx: strokeW, dy: strokeW)).fill()
                 x += dotRadius * 2 + spacing
             }
             return true
@@ -401,11 +505,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func colorForStatus(_ status: String?) -> NSColor {
         switch status {
-        case "operational":          return NSColor(calibratedRed: 0.46, green: 0.68, blue: 0.16, alpha: 1.0)
-        case "degraded_performance": return NSColor(calibratedRed: 0.98, green: 0.65, blue: 0.17, alpha: 1.0)
-        case "partial_outage":       return NSColor(calibratedRed: 0.91, green: 0.38, blue: 0.21, alpha: 1.0)
-        case "major_outage":         return NSColor(calibratedRed: 0.88, green: 0.26, blue: 0.26, alpha: 1.0)
-        case "under_maintenance":    return NSColor(calibratedRed: 0.17, green: 0.52, blue: 0.86, alpha: 1.0)
+        case "operational":          return NSColor(calibratedRed: 0.46, green: 0.68, blue: 0.16, alpha: 1)
+        case "degraded_performance": return NSColor(calibratedRed: 0.98, green: 0.65, blue: 0.17, alpha: 1)
+        case "partial_outage":       return NSColor(calibratedRed: 0.91, green: 0.38, blue: 0.21, alpha: 1)
+        case "major_outage":         return NSColor(calibratedRed: 0.88, green: 0.26, blue: 0.26, alpha: 1)
+        case "under_maintenance":    return NSColor(calibratedRed: 0.17, green: 0.52, blue: 0.86, alpha: 1)
         default:                     return NSColor.tertiaryLabelColor
         }
     }
@@ -414,101 +518,66 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func buildMenu() {
         let menu = NSMenu()
+        let prefs = Preferences.shared
 
-        // Header — no flag
+        // Header
         let headerTitle = lastStatus?.description ?? "Loading..."
         let headerItem = NSMenuItem(title: headerTitle, action: nil, keyEquivalent: "")
-        headerItem.attributedTitle = NSAttributedString(
-            string: headerTitle,
-            attributes: [.font: NSFont.systemFont(ofSize: 13, weight: .semibold)]
-        )
+        headerItem.attributedTitle = NSAttributedString(string: headerTitle, attributes: [
+            .font: NSFont.systemFont(ofSize: 13, weight: .semibold)
+        ])
         menu.addItem(headerItem)
         menu.addItem(NSMenuItem.separator())
 
-        // Services
-        if let status = lastStatus {
-            let sectionItem = NSMenuItem(title: "SERVICES", action: nil, keyEquivalent: "")
-            sectionItem.attributedTitle = NSAttributedString(
-                string: "SERVICES",
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: 10, weight: .bold),
-                    .foregroundColor: NSColor.secondaryLabelColor
-                ]
-            )
-            menu.addItem(sectionItem)
+        // Services section label
+        let sectionItem = NSMenuItem(title: "SERVICES", action: nil, keyEquivalent: "")
+        sectionItem.attributedTitle = NSAttributedString(string: "SERVICES", attributes: [
+            .font: NSFont.systemFont(ofSize: 10, weight: .bold),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ])
+        menu.addItem(sectionItem)
 
-            let prefs = Preferences.shared
+        if let status = lastStatus {
             let allSorted = prefs.sorted(status.components)
             let allNames = allSorted.map { $0.shortName }
             let displayed = prefs.hideDisabledInMenu ? allSorted.filter { prefs.isEnabled($0.shortName) } : allSorted
 
             for comp in displayed {
-                let icon = statusIcon(comp.status)
-                let label = statusLabel(comp.status)
                 let enabled = prefs.isEnabled(comp.shortName)
-                let fullIdx = allNames.firstIndex(of: comp.shortName) ?? 0
 
-                let sub = NSMenu()
+                // Service row (custom view — stays open on interaction)
+                let rowView = ServiceRowView(
+                    shortName: comp.shortName,
+                    statusEmoji: statusEmoji(comp.status),
+                    statusLabel: statusLabel(comp.status),
+                    isEnabled: enabled
+                )
 
-                // Visible in menu bar toggle
-                let visibleItem = NSMenuItem(title: "Visible in Menu Bar", action: #selector(toggleComponent(_:)), keyEquivalent: "")
-                visibleItem.target = self
-                visibleItem.representedObject = comp.shortName
-                visibleItem.state = enabled ? .on : .off
-                sub.addItem(visibleItem)
-
-                // Hide disabled from list toggle (global pref)
-                let hideItem = NSMenuItem(title: "Hide Disabled from List", action: #selector(toggleHideDisabled(_:)), keyEquivalent: "")
-                hideItem.target = self
-                hideItem.state = prefs.hideDisabledInMenu ? .on : .off
-                sub.addItem(hideItem)
-
-                sub.addItem(NSMenuItem.separator())
-
-                // Reorder
-                let upItem = NSMenuItem(title: "↑ Move Up", action: #selector(moveComponentUp(_:)), keyEquivalent: "")
-                upItem.target = self
-                upItem.representedObject = comp.shortName
-                upItem.isEnabled = fullIdx > 0
-                sub.addItem(upItem)
-
-                let downItem = NSMenuItem(title: "↓ Move Down", action: #selector(moveComponentDown(_:)), keyEquivalent: "")
-                downItem.target = self
-                downItem.representedObject = comp.shortName
-                downItem.isEnabled = fullIdx < allNames.count - 1
-                sub.addItem(downItem)
-
-                // Uptime chart
-                if let chartImage = UptimeFetcher.shared.buildUptimeImage(for: comp.shortName) {
-                    sub.addItem(NSMenuItem.separator())
-
-                    if let avg = UptimeFetcher.shared.averageUptime(for: comp.shortName) {
-                        let pctItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-                        pctItem.attributedTitle = NSAttributedString(
-                            string: String(format: "%.2f%% uptime · 90 days", avg),
-                            attributes: [
-                                .font: NSFont.systemFont(ofSize: 11),
-                                .foregroundColor: NSColor.secondaryLabelColor
-                            ]
-                        )
-                        sub.addItem(pctItem)
+                rowView.toggleAction = { [weak self] in
+                    guard let self = self else { return }
+                    prefs.toggle(comp.shortName)
+                    self.updateIcon()
+                    // If hide-disabled is on and we just disabled something, rebuild
+                    if prefs.hideDisabledInMenu && !prefs.isEnabled(comp.shortName) {
+                        self.buildMenu()
                     }
-
-                    let barItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-                    barItem.image = chartImage
-                    sub.addItem(barItem)
                 }
 
-                let itemTitle = "\(icon)  \(comp.shortName) — \(label)"
-                let mainItem = NSMenuItem(title: itemTitle, action: nil, keyEquivalent: "")
-                if !enabled {
-                    mainItem.attributedTitle = NSAttributedString(
-                        string: itemTitle,
-                        attributes: [.foregroundColor: NSColor.tertiaryLabelColor]
-                    )
+                rowView.moveAction = { [weak self] rowsToMove in
+                    guard let self = self else { return }
+                    prefs.move(comp.shortName, by: rowsToMove, in: allNames)
+                    self.buildMenu()
                 }
-                mainItem.submenu = sub
-                menu.addItem(mainItem)
+
+                let rowItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+                rowItem.view = rowView
+                menu.addItem(rowItem)
+
+                // Uptime row (custom view — absorbs clicks, never closes menu)
+                let uptimeView = UptimeRowView(shortName: comp.shortName)
+                let uptimeItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+                uptimeItem.view = uptimeView
+                menu.addItem(uptimeItem)
             }
         } else {
             menu.addItem(NSMenuItem(title: "Fetching status...", action: nil, keyEquivalent: ""))
@@ -527,39 +596,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
+        // Hide Disabled toggle (above Refresh)
+        let hideItem = NSMenuItem(title: "Hide Disabled from List", action: #selector(toggleHideDisabled), keyEquivalent: "")
+        hideItem.target = self
+        hideItem.state = Preferences.shared.hideDisabledInMenu ? .on : .off
+        menu.addItem(hideItem)
+
+        menu.addItem(NSMenuItem.separator())
+
         let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refreshNow), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
 
         var infoLine = "v\(APP_VERSION)"
-        if let fetchTime = lastFetchTime {
-            let fmt = DateFormatter()
-            fmt.dateFormat = "h:mm:ss a"
-            infoLine += " · Updated \(fmt.string(from: fetchTime))"
+        if let ft = lastFetchTime {
+            let fmt = DateFormatter(); fmt.dateFormat = "h:mm:ss a"
+            infoLine += " · Updated \(fmt.string(from: ft))"
         }
         if let apiTime = lastStatus?.updatedAt, !apiTime.isEmpty {
             infoLine += "\nAPI: \(apiTime) UTC"
         }
         let infoItem = NSMenuItem(title: infoLine, action: nil, keyEquivalent: "")
-        infoItem.attributedTitle = NSAttributedString(
-            string: infoLine,
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 10),
-                .foregroundColor: NSColor.tertiaryLabelColor
-            ]
-        )
+        infoItem.attributedTitle = NSAttributedString(string: infoLine, attributes: [
+            .font: NSFont.systemFont(ofSize: 10),
+            .foregroundColor: NSColor.tertiaryLabelColor
+        ])
         menu.addItem(infoItem)
 
         menu.addItem(NSMenuItem.separator())
 
         let flagItem = NSMenuItem(title: "🇺🇸 Made in America", action: nil, keyEquivalent: "")
-        flagItem.attributedTitle = NSAttributedString(
-            string: "🇺🇸 Made in America",
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 11, weight: .medium),
-                .foregroundColor: NSColor.secondaryLabelColor
-            ]
-        )
+        flagItem.attributedTitle = NSAttributedString(string: "🇺🇸 Made in America", attributes: [
+            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ])
         menu.addItem(flagItem)
 
         let quitItem = NSMenuItem(title: "Quit Claude Status", action: #selector(quit), keyEquivalent: "q")
@@ -569,7 +639,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
-    func statusIcon(_ status: String) -> String {
+    func statusEmoji(_ status: String) -> String {
         switch status {
         case "operational":          return "🟢"
         case "degraded_performance": return "🟡"
@@ -593,44 +663,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Actions
 
-    @objc func toggleComponent(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String else { return }
-        Preferences.shared.toggle(name)
-        updateIcon()
-        buildMenu()
-    }
-
-    @objc func moveComponentUp(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String,
-              let components = lastStatus?.components else { return }
-        let allNames = Preferences.shared.sorted(components).map { $0.shortName }
-        Preferences.shared.move(name, by: -1, in: allNames)
-        buildMenu()
-    }
-
-    @objc func moveComponentDown(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String,
-              let components = lastStatus?.components else { return }
-        let allNames = Preferences.shared.sorted(components).map { $0.shortName }
-        Preferences.shared.move(name, by: 1, in: allNames)
-        buildMenu()
-    }
-
-    @objc func toggleHideDisabled(_ sender: NSMenuItem) {
+    @objc func toggleHideDisabled() {
         Preferences.shared.hideDisabledInMenu.toggle()
         buildMenu()
     }
 
     @objc func openDashboard() {
-        let script = """
-        tell application "Terminal"
-            activate
-            do script "\(dashboardPath)"
-        end tell
-        """
-        if let appleScript = NSAppleScript(source: script) {
-            appleScript.executeAndReturnError(nil)
-        }
+        let script = "tell application \"Terminal\"\nactivate\ndo script \"\(dashboardPath)\"\nend tell"
+        if let s = NSAppleScript(source: script) { s.executeAndReturnError(nil) }
     }
 
     @objc func openBrowser() {
@@ -639,13 +679,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func refreshNow() {
         fetchAndUpdate()
-        UptimeFetcher.shared.startFetching()
+        UptimeFetcher.shared.refresh()
         SelfUpdater.checkAndUpdate()
     }
 
-    @objc func quit() {
-        NSApp.terminate(nil)
-    }
+    @objc func quit() { NSApp.terminate(nil) }
 }
 
 // MARK: - Main
