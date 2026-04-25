@@ -1,6 +1,6 @@
 import Cocoa
 
-let APP_VERSION = "2.1.2"
+let APP_VERSION = "2.1.3"
 let SWIFT_SOURCE_URL = "https://raw.githubusercontent.com/adversarydsgn/claude-status/main/ClaudeStatusMenubar.swift"
 
 // MARK: - Self-Updater
@@ -305,8 +305,6 @@ class ServiceRowView: NSView {
     var moveAction: ((Int) -> Void)?
 
     private var isHovered = false
-    private var dragStartWindowY: CGFloat = 0
-    private var eventMonitor: Any?
 
     static let rowHeight: CGFloat = 22
     static let handleW: CGFloat = 30
@@ -334,14 +332,16 @@ class ServiceRowView: NSView {
             : (isServiceEnabled ? .labelColor : .secondaryLabelColor)
         let dimColor: NSColor = isHovered ? NSColor.white.withAlphaComponent(0.55) : .quaternaryLabelColor
 
-        // ≡ drag handle (3 horizontal bars)
-        dimColor.setFill()
-        let lw: CGFloat = 10, lh: CGFloat = 1.5
-        let lx = (ServiceRowView.handleW - lw) / 2
-        for i in 0..<3 {
-            let ly = bounds.midY + CGFloat(i - 1) * 4.5 - lh / 2
-            NSBezierPath(rect: NSRect(x: lx, y: ly, width: lw, height: lh)).fill()
-        }
+        // ▲▼ tap-to-reorder: top half = up, bottom half = down
+        let arrowAttrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 9, weight: .medium),
+            .foregroundColor: dimColor
+        ]
+        let upStr = NSAttributedString(string: "▲", attributes: arrowAttrs)
+        let dnStr = NSAttributedString(string: "▼", attributes: arrowAttrs)
+        let ax = (ServiceRowView.handleW - upStr.size().width) / 2
+        upStr.draw(at: NSPoint(x: ax, y: bounds.midY + 1))
+        dnStr.draw(at: NSPoint(x: ax, y: bounds.midY - dnStr.size().height - 0))
 
         // Status + name
         let title = "\(statusEmoji)  \(shortName) — \(statusLabel)"
@@ -369,26 +369,14 @@ class ServiceRowView: NSView {
     override func mouseDown(with event: NSEvent) {
         let loc = convert(event.locationInWindow, from: nil)
         if loc.x < ServiceRowView.handleW {
-            dragStartWindowY = event.locationInWindow.y
-            NSCursor.closedHand.push()
-            eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDragged, .leftMouseUp]) { [weak self] e in
-                guard let self = self else { return e }
-                if e.type == .leftMouseUp { self.endDrag(e) }
-                return e
-            }
+            // Top half = move up (-1), bottom half = move down (+1)
+            let offset = loc.y >= bounds.midY ? -1 : 1
+            moveAction?(offset)
         } else {
             isServiceEnabled.toggle()
             needsDisplay = true
             toggleAction?()
         }
-    }
-
-    private func endDrag(_ event: NSEvent) {
-        NSCursor.pop()
-        if let m = eventMonitor { NSEvent.removeMonitor(m); eventMonitor = nil }
-        let deltaY = dragStartWindowY - event.locationInWindow.y
-        let rows = Int((deltaY / ServiceRowView.rowHeight).rounded())
-        if rows != 0 { moveAction?(rows) }
     }
 }
 
