@@ -1,6 +1,6 @@
 import Cocoa
 
-let APP_VERSION = "2.1.0"
+let APP_VERSION = "2.1.1"
 let SWIFT_SOURCE_URL = "https://raw.githubusercontent.com/adversarydsgn/claude-status/main/ClaudeStatusMenubar.swift"
 
 // MARK: - Self-Updater
@@ -101,7 +101,10 @@ class UptimeFetcher {
         var req = URLRequest(url: url)
         req.cachePolicy = .reloadIgnoringLocalCacheData
         req.timeoutInterval = 15
-        req.setValue("claude-status-menubar/\(APP_VERSION)", forHTTPHeaderField: "User-Agent")
+        // Browser UA required — statuspage.io serves a JS shell to non-browser agents
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
+        req.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        req.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
         URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
             guard let data = data, let html = String(data: data, encoding: .utf8) else { return }
             self?.parse(html)
@@ -136,7 +139,11 @@ class UptimeFetcher {
                   let name = component["name"] as? String,
                   let days = compDict["days"] as? [[String: Any]]
             else { continue }
-            let scores = days.compactMap { $0["uptime_score"] as? Double }
+            let scores = days.compactMap { day -> Double? in
+                if let d = day["uptime_score"] as? Double { return d }
+                if let i = day["uptime_score"] as? Int { return Double(i) }
+                return nil
+            }
             if !scores.isEmpty { result[name] = scores }
         }
 
@@ -319,8 +326,8 @@ class ServiceRowView: NSView {
         }
 
         let textColor: NSColor = isHovered
-            ? (isServiceEnabled ? .white : NSColor.white.withAlphaComponent(0.45))
-            : (isServiceEnabled ? .labelColor : .tertiaryLabelColor)
+            ? (isServiceEnabled ? .white : NSColor.white.withAlphaComponent(0.6))
+            : (isServiceEnabled ? .labelColor : .secondaryLabelColor)
         let dimColor: NSColor = isHovered ? NSColor.white.withAlphaComponent(0.55) : .quaternaryLabelColor
 
         // ≡ drag handle (3 horizontal bars)
@@ -413,7 +420,7 @@ class UptimeRowView: NSView {
         } else {
             let loadAS = NSAttributedString(string: "loading uptime...", attributes: [
                 .font: NSFont.systemFont(ofSize: 10),
-                .foregroundColor: NSColor.quaternaryLabelColor
+                .foregroundColor: NSColor.tertiaryLabelColor
             ])
             loadAS.draw(at: NSPoint(x: indent, y: (bounds.height - loadAS.size().height) / 2))
         }
