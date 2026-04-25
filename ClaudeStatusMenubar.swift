@@ -1,6 +1,6 @@
 import Cocoa
 
-let APP_VERSION = "2.1.1"
+let APP_VERSION = "2.1.2"
 let SWIFT_SOURCE_URL = "https://raw.githubusercontent.com/adversarydsgn/claude-status/main/ClaudeStatusMenubar.swift"
 
 // MARK: - Self-Updater
@@ -139,10 +139,14 @@ class UptimeFetcher {
                   let name = component["name"] as? String,
                   let days = compDict["days"] as? [[String: Any]]
             else { continue }
-            let scores = days.compactMap { day -> Double? in
-                if let d = day["uptime_score"] as? Double { return d }
-                if let i = day["uptime_score"] as? Int { return Double(i) }
-                return nil
+            let scores: [Double] = days.map { day in
+                let outages = day["outages"] as? [String: Any] ?? [:]
+                let outSecs = outages.values.reduce(0.0) { acc, v in
+                    if let d = v as? Double { return acc + d }
+                    if let i = v as? Int { return acc + Double(i) }
+                    return acc
+                }
+                return max(0, min(100, (86400.0 - outSecs) / 86400.0 * 100.0))
             }
             if !scores.isEmpty { result[name] = scores }
         }
